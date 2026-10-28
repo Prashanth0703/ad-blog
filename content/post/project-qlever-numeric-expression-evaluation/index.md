@@ -1,5 +1,5 @@
 ---
-title: "Optimizing numeric expressions in QLever"
+title: "Optimizing SPARQL Expression Evaluation in QLever"
 date: 2026-10-26T12:00:00+05:30
 author: "Prashanth Premakumar"
 authorAvatar: "img/author_pp.jpeg"
@@ -17,20 +17,32 @@ work QLever can avoid while preserving its existing expression behavior.
 
 ## Content
 
-- [Why optimize an addition?](#why-optimize-an-addition)
-- [The original path: more than arithmetic](#the-original-path-more-than-arithmetic)
-- [First remove generator overhead](#first-remove-generator-overhead)
-- [Then specialize homogeneous operands](#then-specialize-homogeneous-operands)
-- [Mostly homogeneous data: keep the common row small](#mostly-homogeneous-data-keep-the-common-row-small)
-- [Extending indexed execution to N-ary expressions](#extending-indexed-execution-to-n-ary-expressions)
-- [Avoiding doomed conversions, and supporting dates](#avoiding-doomed-conversions-and-supporting-dates)
-- [Why the classifier looks more complicated than necessary](#why-the-classifier-looks-more-complicated-than-necessary)
-- [Controlled evaluation](#controlled-evaluation)
-- [Where execution time goes now](#where-execution-time-goes-now)
-- [Limits and remaining opportunities](#limits-and-remaining-opportunities)
-- [Conclusion](#conclusion)
+- [Introduction and motivation](#introduction-and-motivation)
+  - [Why optimize an addition?](#why-optimize-an-addition)
+  - [The original evaluation path](#the-original-evaluation-path)
+- [Implementation](#implementation)
+  - [Lessons from the batching prototype](#lessons-from-the-batching-prototype)
+  - [Removing generator overhead](#removing-generator-overhead)
+  - [Specializing homogeneous operands](#specializing-homogeneous-operands)
+  - [Speculative execution for mixed inputs](#speculative-execution-for-mixed-inputs)
+  - [Extending the approach to N-ary expressions](#extending-the-approach-to-n-ary-expressions)
+  - [Handling UNDEF and dates](#handling-undef-and-dates)
+  - [Classification and vectorization](#classification-and-vectorization)
+- [Evaluation](#evaluation)
+  - [Experimental setup](#experimental-setup)
+  - [Three stages of evaluation](#three-stages-of-evaluation)
+  - [Focused date and UNDEF controls](#focused-date-and-undef-controls)
+- [Profiling findings](#profiling-findings)
+  - [Historical flamegraphs](#historical-flamegraphs)
+  - [Where execution time goes now](#where-execution-time-goes-now)
+- [Discussion and conclusion](#discussion-and-conclusion)
+  - [Limitations](#limitations)
+  - [Remaining opportunities](#remaining-opportunities)
+  - [Conclusion](#conclusion)
 
-## Why optimize an addition?
+## Introduction and motivation
+
+### Why optimize an addition?
 
 Consider the expression in this query:
 
@@ -54,7 +66,7 @@ homogeneous and speculative numeric paths, and extensions for undefined inputs
 and dates. The central questions are where execution time went originally,
 which work the optimizations remove, and what remains afterward.
 
-## The original path: more than arithmetic
+### The original evaluation path
 
 QLever stores query results in tables of encoded values called Ids. An Id's tag
 identifies its datatype; integer and double payloads can be accessed without a
@@ -78,7 +90,9 @@ The type erasure was deliberate: exposing every combination of input types to
 the compiler can make template instantiation prohibitively expensive. Removing
 runtime overhead therefore also required respecting compilation constraints.
 
-### Why the first batching prototype did not help
+## Implementation
+
+### Lessons from the batching prototype
 
 My first prototype converted batches of Ids into intermediate `NumericValue`
 vectors and then added them. Early experiments reported that it could be slower
@@ -87,40 +101,10 @@ the conversion and variant processing, and materializing another representation
 introduced additional work.
 
 A standalone benchmark, constructed like the expression unit tests, made that
-cost visible without involving the server, planner, or result export. The
-historical profiles show how the investigation developed:
+cost visible without involving the server, planner, or result export. The historical flamegraphs discussed under [Profiling findings](#profiling-findings)
+show why conversion and child-expression costs needed closer investigation.
 
-| Prototype profile | Important inclusive profile weights | Finding |
-|---|---|---|
-| Initial batching prototype (July 2) | Addition evaluator 94.82%; nested `getNumericBatch` 75.49% | Investigate conversion/materialization before the arithmetic. |
-| Integer-specialized conversion (July 7) | Conversion subtree 47.50%; separate variant frame 27.29%; `isAllInt` 5.36% | Specializing conversion still leaves intermediate representation costs. |
-| DBLP query (July 14) | Addition evaluator 52.41%; nested multiplication 51.42%; nested YEAR evaluator 20.18% | Much of the apparent addition cost belongs to child expressions. |
-
-Open the complete interactive profiles in new tabs:
-<a href="img/flamegraph-batched-add-2026-07-02.svg" target="_blank" rel="noopener">Batch conversion dominates the first prototype</a>,
-<a href="img/flamegraph-integer-conversion-2026-07-07.svg" target="_blank" rel="noopener">Integer conversion still leaves variant overhead</a>, and
-<a href="img/flamegraph-dblp-direct-integer-2026-07-14.svg" target="_blank" rel="noopener">DBLP: child expressions dominate the addition frame</a>.
-Click frames to zoom and search for the named functions.
-
-These are historical prototype profiles, not before/after measurements of the
-final implementation. Their percentages are inclusive: parent and child widths
-overlap. In the integer-conversion graph, `getNumericBatch` and `getNumericBatchInt` both show
-47.50% because they cover the same nested subtree. They must not be counted twice.
-A larger percentage across two graphs also does not imply a larger absolute cost.
-
-The DBLP graph illustrates another trap: the addition evaluator includes the
-work of its multiplication children. Its 52.41% width is not the cost of the
-addition instruction. Likewise, an export-related ancestor can include lazy
-query computation; its width does not isolate serialization. This motivated
-reusable improvements beyond a dedicated addition expression.
-
-An <a href="img/flamegraph-initial-unsymbolized-2026-06-25.svg" target="_blank" rel="noopener">initial server profile with unresolved symbols</a>
-contains many unresolved server frames and is less useful for named-function
-attribution. Exact binary revisions, event settings, and raw recordings are not
-embedded in the surviving SVGs, so they provide development context rather than
-controlled final results.
-
-## First remove generator overhead
+### Removing generator overhead
 
 The first integrated change, [PR #3205](https://github.com/ad-freiburg/qlever/pull/3205),
 introduced `BinaryExpression`. It converts variables to non-owning column spans,
@@ -140,7 +124,7 @@ and determinism handling are shared with N-ary expressions. This is important
 for integration: a faster inner loop must continue to work as an ordinary
 expression in the query engine.
 
-## Then specialize homogeneous operands
+### Specializing homogeneous operands
 
 Removing generators does not remove generic type handling. The next step,
 [PR #3366](https://github.com/ad-freiburg/qlever/pull/3366), classifies supported
@@ -172,7 +156,7 @@ whether non-finite results become UNDEF. Addition and subtraction reuse their
 existing primitive overloads. Classification is included in complete-expression
 timings; measuring only the typed loop would overstate the benefit.
 
-## Mostly homogeneous data: keep the common row small
+### Speculative execution for mixed inputs
 
 An all-or-nothing fast path is fragile: one double in an otherwise integer column
 would send the entire expression through generic evaluation.
@@ -196,7 +180,7 @@ accepted through their existing getter conversion, even though they have no
 homogeneous primitive fast path. A heavily mixed column may still benefit much
 less, especially when ties prevent speculative selection.
 
-## Extending indexed execution to N-ary expressions
+### Extending the approach to N-ary expressions
 
 [PR #3604](https://github.com/ad-freiburg/qlever/pull/3604) applies the same direction
 to the generic N-ary evaluator. After existing specialized-function handling,
@@ -222,9 +206,9 @@ also mattered: named temporaries were necessary to work around Clang 16/17
 code-generation failures. The evaluation below uses a synthetic three-argument
 sum to probe this infrastructure; it is not presented as a SPARQL built-in.
 
-## Avoiding doomed conversions, and supporting dates
+### Handling UNDEF and dates
 
-### Direct UNDEF where semantics permit it
+#### Direct UNDEF where semantics permit it
 
 Sometimes the datatype already establishes the result. For an eligible numeric
 operation, an operand rejected by the numeric getter can only produce UNDEF.
@@ -246,7 +230,7 @@ checks. Otherwise, direct-UNDEF checks add work to valid rows while saving work
 on invalid ones. Fully numeric controls and different invalid-value mixtures
 are therefore necessary to assess the tradeoff.
 
-### Homogeneous dates and durations
+#### Homogeneous dates and durations
 
 The date follow-up, [PR #3737](https://github.com/ad-freiburg/qlever/pull/3737),
 shares the numeric machinery rather than maintaining a second evaluator. For
@@ -260,7 +244,7 @@ it does not replace timezone or duration rules with raw integer subtraction.
 Speculative execution can likewise handle eligible date rows while preserving
 fallback behavior for outliers.
 
-## Why the classifier looks more complicated than necessary
+### Classification and vectorization
 
 The final classifier processes blocks of 32 Ids. It extracts their datatype tags
 and ORs the XOR of each tag with the first. A zero result establishes homogeneity,
@@ -281,7 +265,9 @@ classifier, and SIMD instructions in the typed evaluation loops. These findings
 apply to this compiler and target. They do not show that explicit SIMD would
 necessarily be faster, nor establish a bandwidth bottleneck.
 
-## Controlled evaluation
+## Evaluation
+
+### Experimental setup
 
 The three-stage experiment compares the original production evaluator, indexed
 generic binary evaluation, and the final project branch:
@@ -412,11 +398,51 @@ while the integer control is close. Small effects can depend on code generation
 and shared-host variation; this result is reported rather than called universally
 regression-free. Broader distributions would be needed to establish their impact.
 
-## Where execution time goes now
+## Profiling findings
 
-Host policy currently denies perf events, so no security settings were changed.
-Separate executables linked from the optimized objects enable GNU user-space
-CPU sampling at 100 Hz. Approximately 1,000–1,200 executable-text samples per
+### Historical flamegraphs
+
+The historical flamegraphs were collected with `perf record --call-graph fp`,
+then processed with `perf script` and the FlameGraph stack-collapsing and SVG
+generation scripts. They show how the investigation developed:
+
+| Prototype profile | Important inclusive profile weights | Finding |
+|---|---|---|
+| Initial batching prototype (July 2) | Addition evaluator 94.82%; nested `getNumericBatch` 75.49% | Investigate conversion/materialization before the arithmetic. |
+| Integer-specialized conversion (July 7) | Conversion subtree 47.50%; separate variant frame 27.29%; `isAllInt` 5.36% | Specializing conversion still leaves intermediate representation costs. |
+| DBLP query (July 14) | Addition evaluator 52.41%; nested multiplication 51.42%; nested YEAR evaluator 20.18% | Much of the apparent addition cost belongs to child expressions. |
+
+Open the complete interactive profiles in new tabs:
+<a href="img/flamegraph-batched-add-2026-07-02.svg" target="_blank" rel="noopener">Batch conversion dominates the first prototype</a>,
+<a href="img/flamegraph-integer-conversion-2026-07-07.svg" target="_blank" rel="noopener">Integer conversion still leaves variant overhead</a>, and
+<a href="img/flamegraph-dblp-direct-integer-2026-07-14.svg" target="_blank" rel="noopener">DBLP: child expressions dominate the addition frame</a>.
+Click frames to zoom and search for the named functions.
+
+These are historical prototype profiles, not before/after measurements of the
+final implementation. Their percentages are inclusive: parent and child widths
+overlap. In the integer-conversion graph, `getNumericBatch` and `getNumericBatchInt` both show
+47.50% because they cover the same nested subtree. They must not be counted twice.
+A larger percentage across two graphs also does not imply a larger absolute cost.
+
+The DBLP graph illustrates another trap: the addition evaluator includes the
+work of its multiplication children. Its 52.41% width is not the cost of the
+addition instruction. Likewise, an export-related ancestor can include lazy
+query computation; its width does not isolate serialization. This motivated
+reusable improvements beyond a dedicated addition expression.
+
+An <a href="img/flamegraph-initial-unsymbolized-2026-06-25.svg" target="_blank" rel="noopener">initial server profile with unresolved symbols</a>
+contains many unresolved server frames and is less useful for named-function
+attribution. Exact binary revisions, sampled event details, and raw recordings are not
+embedded in the surviving SVGs. Frame-pointer call stacks also depend on frame
+pointers being available in the profiled code; that build setting has not been
+verified for these captures. The graphs therefore provide development context
+rather than controlled final results.
+
+### Where execution time goes now
+
+The profiles in the following table were collected separately from the historical
+perf flamegraphs. Separate executables linked from the optimized objects were
+profiled using GNU user-space CPU sampling at 100 Hz. Approximately 1,000–1,200 executable-text samples per
 profile provide a flat function-region view, not an instrumented call graph.
 Shared-library costs outside the executable text, including allocator/libc work,
 are not represented in these shares.
@@ -450,7 +476,9 @@ The final 50/50 mixed numeric profile still places about 61% in the generic
 getter and about 4.4% in classification. This explains why eliminating the
 homogeneous case's dispatch does not remove the same cost from all inputs.
 
-## Limits and remaining opportunities
+## Discussion and conclusion
+
+### Limitations
 
 The evaluation is deliberately concentrated on expression execution. Query
 planning, joins, storage access, and export can dominate complete queries, so
@@ -465,6 +493,8 @@ classification, block boundaries, and speculative outliers. The full SPARQL suit
 was not rerun. Compiler, cache-size, clustering, and realistic distribution
 sensitivity also remain limits of these measurements.
 
+### Remaining opportunities
+
 The largest remaining homogeneous region is the typed loop; tied mixtures still
 spend substantial time in generic getters. Possible further work includes
 classification reuse for repeated operands or a better treatment of those mixed
@@ -473,7 +503,7 @@ cancellation, extra checks, and compiler behavior all matter. No additional
 production optimization is claimed without a controlled gain and correctness
 validation.
 
-## Conclusion
+### Conclusion
 
 The useful change was to move repeated decisions out of the common row. Indexed
 evaluation removed generator traversal; homogeneous classification enabled one
