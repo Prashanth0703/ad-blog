@@ -8,10 +8,26 @@ categories: ["project"]
 draft: true
 ---
 
-A single addition is cheap. Evaluating it over a SPARQL result column can involve
-much more work: finding inputs, interpreting datatypes, traversing generators,
-and constructing results. This project investigates how much of that surrounding
-work QLever can avoid while preserving its existing expression behavior.
+QLever is a database engine for querying knowledge graphs. A knowledge graph
+represents entities and their relationships as facts. For example, a fact can
+state that a particular person was born in a particular city. QLever works with
+RDF, the Resource Description Framework, which represents such facts as triples:
+a subject, a predicate, and an object. In this example, the person is the subject,
+“was born in” is the predicate, and the city is the object. SPARQL is a query
+language for RDF data.
+
+A SPARQL query can also calculate values. For example, the expression `?x + ?y`
+adds the values assigned to two variables for each result row. The addition
+itself is cheap, but QLever must also identify the input datatypes, obtain their
+numeric values, and construct the result. When an expression runs over millions
+of rows, this surrounding work can become expensive.
+
+In this project, I implemented faster evaluation paths that reduce this overhead.
+The experiments show the largest gains when each input column contains a single
+datatype. Mixed columns benefit less, and some cases become slightly slower than
+an intermediate implementation. These measurements concern expression evaluation,
+not complete query execution. This post explains the original evaluator, the
+changes, and the evidence for those results.
 
 <!--more-->
 
@@ -27,11 +43,15 @@ work QLever can avoid while preserving its existing expression behavior.
   - [Speculative execution for mixed inputs](#speculative-execution-for-mixed-inputs)
   - [Extending the approach to N-ary expressions](#extending-the-approach-to-n-ary-expressions)
   - [Handling UNDEF and dates](#handling-undef-and-dates)
+    - [Direct UNDEF where semantics permit it](#direct-undef-where-semantics-permit-it)
+    - [Homogeneous dates and durations](#homogeneous-dates-and-durations)
   - [Classification and vectorization](#classification-and-vectorization)
 - [Evaluation](#evaluation)
   - [Experimental setup](#experimental-setup)
   - [Three stages of evaluation](#three-stages-of-evaluation)
   - [Focused date and UNDEF controls](#focused-date-and-undef-controls)
+    - [Date specialization](#date-specialization)
+    - [Direct UNDEF handling](#direct-undef-handling)
 - [Profiling findings](#profiling-findings)
   - [Historical flamegraphs](#historical-flamegraphs)
   - [Where execution time goes now](#where-execution-time-goes-now)
@@ -44,7 +64,7 @@ work QLever can avoid while preserving its existing expression behavior.
 
 ### Why optimize an addition?
 
-Consider the expression in this query:
+Consider this SPARQL query:
 
 ```sparql
 SELECT ?x ?y ?sum WHERE {
@@ -53,254 +73,491 @@ SELECT ?x ?y ?sum WHERE {
 }
 ```
 
-The small example is easy to evaluate. On a large intermediate result, however,
-the same expression may run millions of times. Both columns might contain only
-integers, yet a general evaluator still needs to support doubles, booleans,
-undefined values, and operations involving dates. The question is whether that
-flexibility has to be paid for on every row.
+`VALUES` supplies three rows with two variables, `?x` and `?y`. `BIND` evaluates
+the expression `?x + ?y` for each row and assigns the result to `?sum`. The query
+returns:
 
-In this student project at the University of Freiburg, supervised by Johannes
-Kalmbach, I investigated numeric expression evaluation in QLever. The work
-progressed from a batching prototype to reusable binary and N-ary evaluation,
-homogeneous and speculative numeric paths, and extensions for undefined inputs
-and dates. The central questions are where execution time went originally,
-which work the optimizations remove, and what remains afterward.
+| `?x` | `?y` | `?sum` |
+|---:|---:|---:|
+| 1 | 10 | 11 |
+| 2 | 20 | 22 |
+| 3 | 30 | 33 |
+
+For this example, QLever needs only three additions. In a larger query, the same
+expression may be evaluated over millions of rows.
+
+All input values in this example are integers. However, QLever's expression
+evaluator must also handle other datatypes, such as doubles, and combinations of
+different datatypes. The original evaluator determined how to interpret the inputs
+separately for each row. Even when every row contained integers, it repeated this
+work.
+
+The goal of this project was to avoid repeated datatype handling where possible.
+The optimized evaluator first checks the datatypes in the input columns. If a
+column contains only integers, the evaluator can select an integer-specific
+evaluation loop instead of repeating the general datatype handling for every row.
 
 ### The original evaluation path
 
-QLever stores query results in tables of encoded values called Ids. An Id's tag
-identifies its datatype; integer and double payloads can be accessed without a
-vocabulary lookup. An expression's child result can also be a constant, a
-variable referring to an input column, or another supported representation.
+QLever stores intermediate query results in tables. Each column corresponds to a
+variable, such as `?x`, and each row contains one assignment of values to those
+variables.
 
-The original arithmetic evaluator used the generic `NaryExpression`
-infrastructure. After evaluating its children, it created operand generators
-that supplied values to the operation. Value getters interpreted the inputs.
-A numeric getter returned a variant containing an integer, a double, or a
-non-numeric marker; addition's date-aware getter also supported dates. The
-operation then dispatched on those alternatives, performed the arithmetic,
-encoded the result as an Id, and appended it to an output vector.
+RDF identifies entities and predicates using Internationalized Resource
+Identifiers (IRIs). An IRI is an identifier such as `https://example.org/person/1`.
+RDF also uses literals to represent values such as numbers and text.
 
-That is useful separation of responsibilities. It also places several layers
-between a column element and its addition. For homogeneous integers, the answer
-to the type question is identical on every row, but the generic path repeats
-getter and variant work. Generator traversal adds another kind of indirection.
+Each table entry occupies 64 bits and is represented in the code by the type
+`Id`. An `Id` can represent an IRI or a literal. Some bits identify how to interpret
+the remaining bits. We call these datatype bits the *tag*.
 
-The type erasure was deliberate: exposing every combination of input types to
-the compiler can make template instantiation prohibitively expensive. Removing
-runtime overhead therefore also required respecting compilation constraints.
+For integers and doubles, QLever stores a numeric representation directly in the
+`Id`. Strings, including IRIs and text literals, are stored separately in a
+dictionary called the *vocabulary*. Their `Id`s contain an index into that
+dictionary. Numeric evaluation can therefore obtain integer and double values
+without looking up a string in the vocabulary.
+
+Now consider `?x + ?y` from the example. The addition has two operands: `?x` and
+`?y`. Both refer to columns in the input table. An operand can also be a constant,
+as in `?x + 10`, or another expression, as in `(?x * 2) + ?y`.
+
+The original evaluator used *generators* to supply successive operand values. A
+generator produces values as the evaluator requests them. For each row, the
+addition evaluator performed these steps:
+
+1. Obtain the next value from each operand's generator.
+2. Interpret each value using a *value getter*. This is a function that converts
+   an `Id` into a value accepted by the operation.
+3. Select the addition operation for the resulting datatypes.
+4. Add the values, encode the result as an `Id`, and append it to the output column.
+
+A numeric getter could return an integer, a double, or a marker for a non-numeric
+value. These alternatives were held in a C++ `variant`: an object that contains
+one of several predefined types. The operation checked which alternatives the
+getters had returned before performing the arithmetic. Date-aware addition also
+supported date values.
+
+This process handled different input datatypes through the same evaluation code.
+However, it repeated generator traversal, value conversion, and datatype selection
+for each row. Even when both input columns contained only integers, the evaluator
+repeated those steps.
 
 ## Implementation
 
+The implementation developed in several steps. The first prototype grouped
+conversions into batches but retained much of the original work. The later
+changes removed generator traversal and repeated datatype handling, then extended
+those changes to more operations and datatypes.
+
 ### Lessons from the batching prototype
 
-My first prototype converted batches of Ids into intermediate `NumericValue`
-vectors and then added them. Early experiments reported that it could be slower
-than the original implementation. Grouping work into batches had not eliminated
-the conversion and variant processing, and materializing another representation
-introduced additional work.
+My first approach separated conversion from addition. Instead of converting two
+`Id`s and adding their values immediately for each row, the prototype first
+converted a batch of inputs into temporary vectors. Each vector contained
+`NumericValue` objects. A `NumericValue` was a C++ variant holding an integer, a
+double, or a marker for a non-numeric input. A second loop read the two temporary
+vectors and computed the sums.
 
-A standalone benchmark, constructed like the expression unit tests, made that
-cost visible without involving the server, planner, or result export. The historical flamegraphs discussed under [Profiling findings](#profiling-findings)
-show why conversion and child-expression costs needed closer investigation.
+For the running example, the prototype would first convert the `Id`s in the `?x`
+and `?y` columns into two vectors of numeric variants. The addition loop would
+then read the corresponding variants, determine their types, and add their
+values.
+
+This approach grouped the conversions together, but it still converted every
+input and checked the variants during addition. It also wrote the converted
+values into temporary vectors and read them back. Early experiments showed that
+the prototype could be slower than the original evaluator. Batching alone had
+not removed the repeated datatype handling.
+
+To investigate the cost, I used a standalone benchmark that constructed and
+evaluated expressions directly, following the setup used by QLever's expression
+unit tests. The benchmark did not run a complete query through the server. It
+therefore let me examine expression evaluation separately from query planning
+and result export. The historical flamegraphs in [Profiling findings](#profiling-findings)
+show the conversion costs in these prototypes.
+
+The lesson was to avoid an extra intermediate representation and reduce the work
+needed to evaluate each row. The next change addressed how the evaluator accessed
+its input values.
 
 ### Removing generator overhead
 
-The first integrated change, [PR #3205](https://github.com/ad-freiburg/qlever/pull/3205),
-introduced `BinaryExpression`. It converts variables to non-owning column spans,
-expands interval sets when necessary, and evaluates vector or constant operands
-with indexed access. The operation and its value getters are template parameters,
-so the infrastructure is reusable rather than specific to addition.
-Addition, subtraction, multiplication, division, and power use this infrastructure.
+The next approach accessed input values by their row index instead of requesting
+successive values from generators. This change introduced `BinaryExpression`,
+the shared evaluator for operations with two operands, in
+[PR #3205](https://github.com/ad-freiburg/qlever/pull/3205). Addition, subtraction,
+multiplication, division, and power use this evaluator.
 
-At this stage, getters still interpret values and operations still handle
-variants. The improvement is a simpler route to each row. A constant's getter
-can additionally run once per expression evaluation, rather than repeatedly for
-every row. Constant–constant input produces a scalar result.
+For `?x + ?y`, the evaluator obtains a view of each input column. A view refers to
+the existing column data without copying it. For row `i`, the evaluator reads the
+`Id`s at position `i` in both columns, applies the value getters and the addition
+operation, and writes the result to the output vector. The loop no longer needs
+to resume operand generators to obtain those values.
 
-The output still uses QLever's memory-limited allocator. Cancellation checks
-remain present, grouped at chunk boundaries. Common child storage, cache keys,
-and determinism handling are shared with N-ary expressions. This is important
-for integration: a faster inner loop must continue to work as an ordinary
-expression in the query engine.
+Constants need different handling. In `?x + 10`, the value `10` is the same for
+every row. The evaluator can apply its value getter once and reuse the converted
+value throughout the loop. If both operands are constants, as in `10 + 20`, the
+evaluator returns a single value rather than constructing a result vector.
+
+This change did not remove the datatype handling described earlier. For column
+values, the getters still converted `Id`s into variants, and the operation still
+checked those variants. It removed generator traversal and, for constant
+operands, repeated conversion. The evaluation below compares this indexed
+evaluator with both the original evaluator and the later datatype-specific
+loops.
+
+The new loop also had to preserve QLever's execution safeguards. Its output
+vector uses QLever's allocator, which enforces the query's memory limit. The
+loop checks for query cancellation at chunk boundaries, so a long evaluation
+can still be interrupted. The same evaluation structure accepts different
+operations and value getters; it is not a separate implementation for each
+arithmetic operator.
 
 ### Specializing homogeneous operands
 
-Removing generators does not remove generic type handling. The next step,
-[PR #3366](https://github.com/ad-freiburg/qlever/pull/3366), classifies supported
-Id operands before evaluation. If each operand is homogeneous, the evaluator
-dispatches once to primitive C++ types and runs a typed loop.
+Indexed access removed generator traversal, but the evaluator still interpreted
+the datatypes separately for each row. In the running example, both input columns
+contain only integers. The next change used that information to select the
+addition loop before processing the rows
+([PR #3366](https://github.com/ad-freiburg/qlever/pull/3366)).
 
-The idea can be summarized with schematic pseudocode:
+A column is *homogeneous* if every value in it has the same datatype. The evaluator
+first examines the datatype tags of the `Id`s in each input column. We call this
+step *classification*. If both columns contain only integers, the evaluator
+selects a loop for two integer operands.
+
+Inside that loop, the datatype of each input is already known. The evaluator
+extracts the integer values directly from the `Id`s, adds them, and encodes the
+result as an `Id`. It does not construct numeric variants or check which variant
+alternatives are present for each row.
+
+The two columns do not have to share a datatype. If `?x` contains only integers
+and `?y` contains only doubles, the evaluator selects the loop for an integer
+and a double. Each column must be homogeneous, but their datatypes can differ.
+For a constant operand, such as `10` in `?x + 10`, the evaluator checks its
+datatype and extracts its value once.
+
+The following pseudocode summarizes this choice:
 
 ```text
-classify each operand
-if every operand has a supported homogeneous type:
-    select the typed operation once
+examine the datatype tags in each input column
+if each operand has one supported datatype:
+    select the loop for that combination of datatypes
     for each row:
-        extract known primitive values
-        apply operation and encode the result
+        extract values of the known datatypes
+        compute the operation and encode its result as an Id
 else:
-    consider speculative execution or use generic evaluation
+    try the mixed-input optimization described next
+    or use the general evaluator
 ```
 
-The operands need not have the same type: an integer column and a double column
-can select the corresponding mixed primitive combination. Scalar inputs are
-classified directly, and their primitive value can be extracted once. Unsupported
-representations retain the generic path.
+The specialized loops preserve the operation's existing arithmetic and result
+encoding. They still allocate and fill an output vector. They also preserve the
+operation's rules for invalid results. For example, if an operation maps a
+non-finite result, such as infinity, to an undefined value, its specialized loop
+must do the same. We use *UNDEF* to refer to an undefined value in the rest of
+this post.
 
-The fast path does not discard result construction. Operations wrapped in
-`MakeNumericExpression` are unwrapped to `NumericIdWrapper`, which avoids
-per-row variant visits while preserving the result-encoding policy, including
-whether non-finite results become UNDEF. Addition and subtraction reuse their
-existing primitive overloads. Classification is included in complete-expression
-timings; measuring only the typed loop would overstate the benefit.
+Classification itself takes time because it examines the input columns before
+the arithmetic loop. The complete-expression measurements below include that
+work, together with result allocation and construction. Measuring only the
+specialized arithmetic loop would overstate the improvement.
 
 ### Speculative execution for mixed inputs
 
-An all-or-nothing fast path is fragile: one double in an otherwise integer column
-would send the entire expression through generic evaluation.
-[PR #3417](https://github.com/ad-freiburg/qlever/pull/3417) instead records a
-preferred datatype for speculative execution.
+The homogeneous optimization requires every value in a column to have the same
+datatype. Consider a column with 99 integers and one double. It is no longer
+homogeneous, so the homogeneous optimization cannot be used. Yet most rows could
+still use integer arithmetic.
 
-In the final implementation, “majority” means the unique most frequent datatype,
-not necessarily more than half the rows. Selection considers every datatype. A
-column containing three doubles, two integers, and many unsupported values must
-not be classified as predominantly double. Ties provide no preferred type.
+[PR #3417](https://github.com/ad-freiburg/qlever/pull/3417) added an optimization
+for such mixed columns. During classification, the evaluator counts the values
+of each datatype. It selects a *preferred datatype* if one datatype occurs more
+often than every other datatype and is supported by the specialized evaluator.
 
-If every operand has an eligible preferred type, matching rows use primitive
-operations. Exceptional binary rows enter a separate slow function. Other
-integer/double combinations are handled directly there; remaining cases retain
-the normal getters and generic operation. Keeping this machinery outside the
-common loop helps avoid burdening every matching row with the full fallback.
+Suppose both `?x` and `?y` contain mostly integers. The evaluator selects integer
+arithmetic as the expected case. For each row, it checks the tags of both input
+`Id`s before extracting their values:
 
-This is guarded execution, not unchecked arithmetic on arbitrary bit patterns
-followed by repair. Tags are checked before primitive extraction. Booleans remain
-accepted through their existing getter conversion, even though they have no
-homogeneous primitive fast path. A heavily mixed column may still benefit much
-less, especially when ties prevent speculative selection.
+- If both inputs are integers, it extracts the integers directly and computes
+  their sum.
+- If either input has another datatype, it sends that row to a separate function
+  that handles the exceptional inputs.
+
+We call this *speculative execution*: the evaluator chooses a likely datatype
+combination, but checks that the current inputs match before using it. It never
+interprets a double or a string reference as an integer merely because most
+other rows contain integers.
+
+For binary expressions, the exceptional-input function handles other integer
+and double combinations directly. For remaining cases, it uses the existing
+value getters and general operation. For example, boolean inputs still use the
+numeric getter's existing conversion to integers. Keeping this handling in a
+separate function keeps the loop for matching rows small.
+
+A preferred datatype need not account for more than half the column. For
+example, a column with 40 integers, 35 doubles, and 25 undefined values has
+integer as its unique most frequent datatype. A column with 50 integers and
+50 doubles has a tie, so neither datatype is preferred. The counts include all
+datatypes, not just the numeric ones. A column dominated by strings must not be
+treated as predominantly integer simply because integers outnumber doubles.
+
+The speculative loop is used only when every operand has a supported preferred
+datatype. Otherwise, evaluation uses the general loop. Mixed columns can
+therefore benefit less than homogeneous columns: matching rows still need tag
+checks, exceptional rows need additional handling, and ties can prevent this
+optimization entirely. The evaluation below includes both mostly integer columns
+and evenly mixed columns to show that difference.
 
 ### Extending the approach to N-ary expressions
 
-[PR #3604](https://github.com/ad-freiburg/qlever/pull/3604) applies the same direction
-to the generic N-ary evaluator. After existing specialized-function handling,
-operands are converted to indexable vectors, spans, or constants. One indexed
-getter is associated with each operand, and an indexed loop invokes the operation.
-Eligible numeric expressions can first try the shared homogeneous or speculative
-helpers. In production, these numeric N-ary fast paths apply to the unary numeric
-functions, such as unary minus, `ABS`, `ROUND`, and `LOG`. Other N-ary expressions,
-including string, language, geo, and conditional expressions, receive the indexed
-loop improvement rather than a numeric specialization. This is the distinction
-made in the [final PR description](https://github.com/ad-freiburg/qlever/pull/3604).
+Addition has two operands and is therefore a *binary* operation. Other
+expressions take a different number of operands. For example, `ABS(?x)` takes
+one operand and returns its absolute value. An operation with N operands is
+called *N-ary*. QLever's `NaryExpression` evaluator supports operations with
+different numbers of operands, including one.
 
-This is more involved than adding another argument to a binary loop. An operation
-with N arguments can encounter many combinations of representations. Compile-time
-eligibility checks restrict numeric specialization to supported getters and Id
-operands; date combinations are instantiated only for date-aware getters. The
-generic fallback still supports other result types and their local-vocabulary
-handling. The cheaper-compilation alternative remains available.
+[PR #3604](https://github.com/ad-freiburg/qlever/pull/3604) extended indexed
+evaluation to this shared evaluator. As with binary expressions, each operand
+can supply a column, a vector computed by another expression, or a constant.
+For each row, the evaluator obtains the corresponding operand values by index,
+applies their value getters, and calls the operation. This replaces generator
+traversal in the general evaluation loop. Expressions that already have their
+own specialized evaluation remain handled separately.
 
-The implementation therefore shares conversion and evaluation machinery without
-pretending that all SPARQL values are primitive numbers. Compiler compatibility
-also mattered: named temporaries were necessary to work around Clang 16/17
-code-generation failures. The evaluation below uses a synthetic three-argument
-sum to probe this infrastructure; it is not presented as a SPARQL built-in.
+Indexed access and numeric specialization are two distinct improvements. Indexed
+access can be used for non-numeric operations as well. For example, expressions
+that process strings use the indexed loop while retaining their existing value
+getters and operations. They do not interpret string references as numbers.
+
+Numeric expressions can additionally use the homogeneous and speculative
+optimizations described above. For `ABS(?x)`, an all-integer column allows the
+evaluator to select the integer loop before processing the rows. A mostly
+integer column can use the speculative loop, with checks for exceptional values.
+In production, the numeric specializations added through `NaryExpression` apply
+to unary numeric operations, including unary minus, `ABS`, `ROUND`, and `LOG`.
+String, language, geographic, and conditional expressions receive the indexed
+loop improvement rather than numeric specialization.
+
+Sharing these loops also requires controlling compilation cost. Each additional
+operand increases the number of possible datatype combinations. Generating a
+specialized C++ loop for every combination would increase the work required from
+the compiler. The implementation therefore checks which combinations an
+operation supports before generating those loops. For example, date combinations
+are generated only for operations whose getters support dates. Other cases
+retain the general evaluator.
+
+The shared implementation also had to compile correctly with QLever's supported
+compilers. Some expressions needed named temporary variables to avoid
+code-generation failures in Clang 16 and 17.
+
+To test the shared numeric machinery with more than two operands, the evaluation
+below includes a three-argument sum constructed for the benchmark. That sum is
+a test operation, not an additional SPARQL built-in function. Its results show
+how the machinery behaves for that example; they do not measure every expression
+that uses `NaryExpression`.
 
 ### Handling UNDEF and dates
 
+The previous optimizations make numeric evaluation faster when the inputs have
+suitable datatypes. Two further changes address inputs outside the integer and
+double cases. The first avoids unnecessary work when an input already guarantees
+an undefined result. The second extends specialized evaluation to dates and
+durations.
+
 #### Direct UNDEF where semantics permit it
 
-Sometimes the datatype already establishes the result. For an eligible numeric
-operation, an operand rejected by the numeric getter can only produce UNDEF.
-[PR #3708](https://github.com/ad-freiburg/qlever/pull/3708) lets evaluation return
-that result without constructing numeric variants and invoking the operation.
+Consider multiplication, `?x * ?y`, with an integer in `?x` and an IRI in `?y`.
+The numeric getter does not accept the IRI as a number. The operation therefore
+cannot produce a numeric result, regardless of the integer's value. The evaluator
+represents this undefined result as UNDEF.
 
-Eligibility is explicit. A function must opt into the guarantee, and the check
-must match its value getter. Booleans remain valid because numeric getters
-convert them to integers. Date-aware addition/subtraction need a different rule:
-a date is not a primitive number, but it can participate in valid arithmetic.
-The initial UNDEF change therefore left date-aware addition and subtraction on
-their existing fallback; the subsequent date work extended the rejection rule
-while allowing date operands. The numeric-only shortcut covers the unary numeric
-functions, multiplication, division, and power.
+The general evaluation path discovers this through the value getters and the
+operation. [PR #3708](https://github.com/ad-freiburg/qlever/pull/3708) allows the
+evaluator to identify such cases from the datatype tags and write UNDEF directly.
+It can skip constructing numeric variants and calling the arithmetic operation
+for that row.
 
-Classification also records whether any datatype is rejected by the getter.
-When it proves all values are accepted, evaluation can omit redundant rejection
-checks. Otherwise, direct-UNDEF checks add work to valid rows while saving work
-on invalid ones. Fully numeric controls and different invalid-value mixtures
-are therefore necessary to assess the tradeoff.
+This shortcut is enabled only for operations that explicitly guarantee that an
+input rejected by their getter makes the result undefined. The rejection check
+must follow that getter's rules. For example, QLever's numeric getter accepts
+booleans and converts them to integers. The shortcut must therefore not reject a
+boolean simply because its tag differs from the integer and double tags.
+
+Dates need a different check. A date is not an integer or a double, but it can
+participate in valid date arithmetic. The initial change left date-aware addition
+and subtraction on their existing general path. It enabled direct UNDEF handling
+for eligible unary numeric operations, multiplication, division, and power. The
+subsequent date change extended the rejection check to the date-aware operations
+while preserving accepted date inputs.
+
+Classification also records whether a column contains any datatype that the
+getter rejects. If every input datatype is accepted, the evaluator can omit the
+rejection checks inside the loop. Otherwise, those checks save work on rejected
+rows but also cost time on accepted rows. The evaluation therefore tests both
+fully numeric columns and columns containing undefined inputs.
 
 #### Homogeneous dates and durations
 
-The date follow-up, [PR #3737](https://github.com/ad-freiburg/qlever/pull/3737),
-shares the numeric machinery rather than maintaining a second evaluator. For
-eligible date-aware getters, classification can select `DateYearOrDuration` as
-the typed representation. The existing date operation still determines whether
-particular dates, dateTimes, durations, and their combinations are compatible.
+Date subtraction illustrates why the same optimization is useful beyond ordinary
+numbers. Suppose two columns contain dates and an expression subtracts one date
+from the other. The result is a duration: a length of time. If the evaluator knows
+that both columns contain date values, it can avoid repeatedly selecting the
+date-related alternatives from variants for every row.
 
-A shared Id datatype does not make all date payloads semantically interchangeable.
-The fast path extracts the date representation and calls existing typed arithmetic;
-it does not replace timezone or duration rules with raw integer subtraction.
-Speculative execution can likewise handle eligible date rows while preserving
-fallback behavior for outliers.
+[PR #3737](https://github.com/ad-freiburg/qlever/pull/3737) extended the existing
+classification and specialized loops to these inputs. QLever uses a C++ type
+called `DateYearOrDuration` to represent its supported date, year, and duration
+values after extraction from an `Id`. For operations with date-aware getters, the
+evaluator can select a loop that extracts this representation directly and calls
+the existing date arithmetic.
+
+Recognizing a date-related representation does not establish that every operation
+on it is valid. A date and a duration, for example, have different meanings even
+though they use the same C++ representation. The existing arithmetic code still
+checks which combinations are supported and applies their date, timezone, and
+duration rules. The optimization changes how values reach that code; it does not
+replace date arithmetic with subtraction of the ``Id``s' raw bits.
+
+Mixed columns can use the same speculative approach as numeric columns. Rows
+matching the selected date-related datatype use the specialized operation.
+Exceptional rows retain the checks and general handling needed for their inputs.
+The date optimization therefore shares the evaluation machinery rather than
+introducing a separate evaluator with different arithmetic rules.
 
 ### Classification and vectorization
 
-The final classifier processes blocks of 32 Ids. It extracts their datatype tags
-and ORs the XOR of each tag with the first. A zero result establishes homogeneity,
-allowing one histogram update for the entire block. Mixed blocks try a two-type
-counting reduction, validate that those types cover the block, and otherwise use
-a general histogram. Incomplete blocks are handled separately.
+Classification determines whether a column is homogeneous and counts the values
+of each datatype for speculative evaluation. These counts form a *histogram*:
+one counter per datatype. A straightforward implementation would read each `Id`,
+extract its tag, and increment the corresponding counter. The final classifier
+instead processes blocks of 32 ``Id``s. This organization lets it count common
+patterns with fewer histogram updates.
 
-Why not simply stop when a mismatch is found? An early-exit variant was tested
-during development and rejected after it regressed homogeneous input. Regular
-reductions give the compiler a different optimization opportunity from a
-row-dependent exit. This historical experiment is separate from the current
-compiler evidence: GCC 13.3 reports 16-byte vectorization for tag extraction,
-the OR/XOR reduction, and two-type counting. The general histogram loop does
-not vectorize.
+For each block, the classifier first checks whether all tags match the first
+tag. It computes the bitwise exclusive OR (XOR) of each tag with the first tag.
+XOR produces zero for equal tags and a nonzero value for different tags. The
+classifier then combines these differences using bitwise OR. The combined result
+is zero exactly when every tag matches. In that case, the classifier adds 32 to
+the counter for that datatype.
 
-Assembly contains packed shifts, XORs, ORs, comparisons, and additions in the
-classifier, and SIMD instructions in the typed evaluation loops. These findings
-apply to this compiler and target. They do not show that explicit SIMD would
-necessarily be faster, nor establish a bandwidth bottleneck.
+For a mixed block, the classifier tries counting occurrences of two candidate
+datatypes. It checks that those counts account for all 32 entries. If they do,
+it adds the two counts to the histogram. If the block contains additional
+datatypes, it uses the general loop that updates a counter for each entry.
+Any entries remaining after the last complete block are handled separately.
+
+This block-based code is more involved than a loop that stops at the first
+mismatching tag. However, an early-exit version tested during development made
+homogeneous input slower. The regular block checks also give the compiler an
+opportunity to process multiple tags with one instruction.
+
+Processing several values with one instruction is called *single instruction,
+multiple data* (SIMD). When a compiler transforms an ordinary loop into SIMD
+instructions, the transformation is called *autovectorization*. The block checks
+use ordinary C++ code rather than explicitly written SIMD instructions.
+
+For the GCC 13.3 build examined here, the compiler's optimization reports indicate
+16-byte vectorization for tag extraction, the XOR/OR check, and the two-datatype
+counting loops. The general loop that updates the histogram for each entry was
+not vectorized. Inspection of the generated machine instructions also found SIMD
+operations in the classifier and in the specialized arithmetic loops.
+
+These observations establish which loops this compiler vectorized. They do not
+isolate how much of the overall speedup comes from vectorization: the evaluator
+also removes generators and repeated variant handling. Nor do they establish
+whether explicitly written SIMD would be faster. That would require a separate
+implementation and a controlled comparison.
+
+For an expression with a fixed number of operands, classification takes time
+proportional to the number of input rows: it examines each input `Id` once.
+Evaluation also processes each row once. If there are n rows, both passes
+therefore take O(n) time, assuming constant-time operations such as numeric
+addition. The original evaluator was linear too; the optimization reduces the
+work per row rather than changing that growth rate. The classifier uses a fixed
+set of datatype counters. A vector result needs O(n) output space, while an
+expression with only constant operands can return a single value.
 
 ## Evaluation
 
+The evaluation asks how much faster the changed evaluator is and which inputs
+benefit. The first experiment compares three source snapshots from the project.
+The second enables and disables the date and UNDEF optimizations within the same
+source version to examine those changes more directly.
+
 ### Experimental setup
 
-The three-stage experiment compares the original production evaluator, indexed
-generic binary evaluation, and the final project branch:
+The first experiment compares three versions of QLever. Each version is a
+snapshot of the source code at a particular Git commit. The commit identifiers
+below specify exactly which source code was built; the stage names explain
+why those versions were selected.
 
-| Revision | Role |
-|---|---|
-| `6358e102802b8c192630814fb8340d2e8dee2c49` | Before PR #3205; original generic evaluator |
-| `9290ebe087ac7a8c20253fe4b8ca40f7ca893949` | Before PR #3366; indexed, generic binary evaluation |
-| `f86881abd8758132017a2d9a747b0fd645dcd79d` | Final project branch including date handling |
+| Stage | Evaluation approach | Git commit |
+|---|---|---|
+| Original evaluator | Before PR #3205; uses generators and general datatype handling | `6358e102802b8c192630814fb8340d2e8dee2c49` |
+| Indexed evaluator | Before PR #3366; uses indexed binary evaluation, without the homogeneous numeric optimization | `9290ebe087ac7a8c20253fe4b8ca40f7ca893949` |
+| Final project version | Includes the later numeric optimizations and date handling | `f86881abd8758132017a2d9a747b0fd645dcd79d` |
 
-All three builds use GCC 13.3, C++20, Release optimization (`-O3 -DNDEBUG`),
-no LTO, and a common copied dependency cache on a Ryzen 7 3700X. No native CPU
-flag was added. Source exports and builds are independent of the development
-checkout. The endpoints span 216 commits, including unrelated changes, and
-common dependency versions differ from some historical pins. Endpoint speedups
-therefore describe the complete comparison, not a causal contribution per PR.
+The middle stage helps distinguish the improvement from indexed binary access
+from the subsequent improvement with numeric specialization. However, these
+snapshots also include unrelated changes: 216 commits separate the original and
+final versions. The experiment therefore compares complete source snapshots. It
+does not measure the contribution of each PR in isolation.
 
-Each workload has 100,000 rows and 50 expression evaluations per timed batch.
-Ten independent processes per revision validate every output row during three
-warmups. Data generation is outside timing; child evaluation, classification,
-allocation, result construction, and destruction are inside. A compiler memory
-barrier retains results. Workloads use a fixed seed, revisions alternate order,
-and runs are pinned to CPU 2. The host is shared, its existing powersave governor
-and boost remain unchanged, and the SMT sibling is not reserved.
+All three versions were compiled with GCC 13.3 in C++20 mode, using the same
+Release optimization settings (`-O3 -DNDEBUG`). Link-time optimization, which
+allows optimization across separately compiled files, was disabled. No
+`-march=native` option was added to specialize the build for the host processor.
+The versions used the same copied set of dependency sources, rather than each
+snapshot's original dependency versions. Separate source and build directories
+kept the experiment independent of the development checkout.
+
+Each test case specifies an expression and a distribution of input datatypes.
+The input table contains 100,000 rows. One timed batch evaluates the expression
+50 times over that table. A time in the results table therefore describes the
+whole batch, not one addition or one query.
+
+Each test case was run in ten independent processes for each source snapshot.
+Before timing, each process performed three warmup evaluations and checked every
+output row against its expected result. Input data was generated before timing.
+For mixed columns, a fixed random seed made the shuffled datatype distribution
+reproducible.
+
+The timed region includes evaluating the operands, classifying their datatypes,
+allocating the output, computing and storing results, and releasing the results.
+A compiler memory barrier prevents the compiler from discarding the result
+computations. The order of source versions was varied between runs to reduce
+systematic effects from running one version first.
+
+The measurements ran on a Ryzen 7 3700X. Each benchmark process was restricted
+to logical CPU 2 to prevent migration between CPUs. The machine was shared with
+other work. Its power policy and automatic frequency boost were left unchanged,
+and the other hardware thread sharing that physical core was not reserved.
+These conditions can cause timing variation, even with a fixed CPU assignment.
 
 ### Three stages of evaluation
 
-The table reports median milliseconds per batch and medians of paired overall
-speedup ratios. Every mixture uses a fixed shuffled exception pattern. The full
-comparison has 300 timed samples, with ten samples for each workload/revision.
-Raw ranges are retained; occasional timing excursions remain on the shared host.
+The table compares the three source snapshots using addition and the
+three-argument test operation introduced earlier. The input labels describe
+where the operand values come from:
 
-| Workload | Original ms | Indexed generic ms | Final ms | Overall speedup |
+- **Vector-vector:** both operands supply one value per row, as in `?x + ?y`.
+- **Vector-constant:** one operand supplies a value per row and the other is a
+  fixed value, as in `?x + 10`.
+- **Mixed inputs:** the percentages describe the datatype distribution in the
+  input columns. The exceptional datatypes are shuffled rather than grouped
+  together.
+- **Ternary:** the benchmark's three-argument sum computes left + right + left.
+  It reads the left input twice and is not a SPARQL built-in function.
+
+Each time is the median of ten measured batches, in milliseconds. Each batch
+contains 50 evaluations over 100,000 rows. A smaller time is better. For each
+sample pair, the original time is divided by the final time to obtain a speedup;
+the last column reports the median of those ten ratios. It is not necessarily
+the ratio of the two displayed medians. A speedup of 2× means that the final
+version takes half as long in that comparison.
+
+| Input case | Original (ms) | Indexed (ms) | Final (ms) | Original-to-final speedup |
 |---|---:|---:|---:|---:|
 | Integer vector-vector | 109.454 | 73.114 | 6.643 | 16.47× |
 | Double vector-vector | 110.575 | 72.431 | 4.853 | 22.99× |
@@ -313,42 +570,77 @@ Raw ranges are retained; occasional timing excursions remain on the shared host.
 | Ternary 90% int / 10% double | 147.292 | 145.958 | 26.327 | 5.60× |
 | Ternary 50% int / 50% double | 147.628 | 146.395 | 116.629 | 1.26× |
 
-The intermediate stage makes the infrastructure contribution visible. Integer
-vector-vector addition improves from 109.45 to 73.11 ms before numeric fast paths
-are introduced. Vector-constant addition benefits more, from 97.30 to 47.20 ms.
-The homogeneous final path then removes much of the remaining generic handling.
-As expected for a binary-only infrastructure change, the intermediate ternary
-results stay close to the original evaluator.
+For integer vector-vector addition, the median batch time falls from 109.45 ms
+in the original evaluator to 73.11 ms in the indexed evaluator. The indexed
+stage still uses general datatype handling. The final version, which can select
+an integer-specific loop, takes 6.64 ms. Integer vector-constant addition follows
+the same pattern, with times of 97.30, 47.20, and 3.85 ms. These results are
+consistent with removing generator traversal first and repeated datatype
+handling afterward. Because other code also changed between snapshots, they do
+not isolate the contribution of each PR.
 
-The 50/50 numeric case exposes a cost hidden by an endpoint-only comparison:
-final evaluation is about 5.8% slower than indexed generic evaluation, despite
-still beating the original implementation. There is no unique preferred type,
-so classification adds work before generic fallback. Historical revisions also
-contain unrelated changes, so these stages do not isolate every PR individually.
+The ternary results help explain the scope of the middle stage. That stage
+changed binary evaluation, so it did not introduce the indexed N-ary evaluator.
+Its ternary times remain close to those of the original version. The final
+version includes the N-ary changes and numeric specialization; its homogeneous
+integer case takes 9.44 ms rather than 147.74 ms.
 
-The synthetic ternary sum reads the left column twice. It probes infrastructure
-with a specific operand-reuse pattern, not the distribution of arbitrary N-ary
-queries. The large homogeneous gains must not be generalized to all mixtures.
+Mixed columns benefit less. The binary 90% integer / 10% double case has an
+overall speedup of 7.53×, compared with 16.47× for all-integer vector-vector
+input. Matching rows can use speculative integer evaluation, but exceptional
+rows require separate handling.
+
+An equal mixture exposes a regression relative to the middle stage. For 50%
+integer / 50% double input, the final version takes 78.85 ms, compared with
+74.50 ms for the indexed evaluator: about 5.8% longer. Neither datatype is uniquely
+most frequent, so the evaluator cannot select a preferred datatype. It performs
+classification before using general evaluation. The final version still beats
+the original version, but that comparison alone would hide the regression.
+
+The experiment contains 300 timed batches across ten input cases and three
+source snapshots. The raw measurements retain the ranges, including occasional
+slow runs on the shared machine. The results concern these expressions, input
+sizes, and datatype distributions. In particular, the ternary operation reuses
+an operand, and its result should not be generalized to arbitrary N-ary
+expressions. Nor should the large homogeneous gains be treated as gains for
+complete SPARQL queries.
 
 ### Focused date and UNDEF controls
 
-To narrow attribution for the extensions, a second experiment uses the same final
-framework and operation on both sides. It toggles date dispatch or direct-UNDEF
-eligibility in benchmark-only types; no production implementation is edited.
-There are 260 timed samples across 26 variants. Each process validates all rows
-before timing, using 100k rows, 50 evaluations, and the same affinity and compiler.
-These timers measure core evaluation, including classification, allocation and
-result destruction, but exclude child-expression evaluation. They are separate
-from the complete-expression table above and are not reconstructed PR timings.
+The source snapshots above contain many changes. To examine the date and
+UNDEF optimizations more directly, a second experiment compares two variants
+within the final source version. One variant enables the optimization under
+study; the other disables it. These switches are implemented in types used only
+by the benchmark. They do not change QLever's production evaluator.
 
-For date subtraction, the disabled control preserves numeric fast-path eligibility
-and the date-aware getter's conversion semantics, but excludes dates from typed
-dispatch. Both variants use the existing typed date subtraction and leave the
-direct-UNDEF shortcut disabled. Expected date/duration results are constructed
-independently as a one-day duration; the dateTime inputs include differing timezone
-offsets. The date data repeats small sets of values.
+Each variant uses 100,000 rows and 50 evaluations per timed batch. There are ten
+measured batches per variant and 260 measurements in total. Each process checks
+all output rows before timing. The compiler and CPU assignment are the same as
+in the three-stage experiment. Times are medians in milliseconds, and speedups
+are medians of paired disabled/enabled timing ratios.
 
-| Workload | Disabled ms | Enabled ms | Paired speedup |
+These measurements start after the operands have been evaluated. They include
+classification, output allocation, computation, and result destruction, but
+exclude the work needed to evaluate the operand expressions. Their absolute
+times therefore should not be compared directly with the complete-expression
+times above. They also do not recreate historical versions of the PRs.
+
+#### Date specialization
+
+The date experiment uses subtraction. With date specialization disabled, date
+inputs pass through the general getter and operation. With it enabled, eligible
+date inputs use the specialized loop. Both variants preserve the same date
+conversion and subtraction rules. Numeric specialization remains available in
+both variants, and direct UNDEF handling is disabled in both. This keeps the
+comparison focused on date specialization.
+
+The test data repeats small sets of date and duration values. Expected valid
+results are constructed independently as one-day durations. The dateTime case
+also includes different timezone offsets. Integer and double subtraction serve
+as comparison cases: enabling date specialization should not materially change
+their execution.
+
+| Input case | Disabled (ms) | Enabled (ms) | Speedup |
 |---|---:|---:|---:|
 | Date subtraction, vector-vector | 253.867 | 182.991 | 1.38× |
 | Date subtraction, vector-constant | 224.315 | 182.758 | 1.23× |
@@ -358,32 +650,42 @@ offsets. The date data repeats small sets of values.
 | Integer subtraction control | 6.618 | 6.629 | 1.00× |
 | Double subtraction control | 4.866 | 4.869 | 1.00× |
 
-Date and dateTime vector subtraction improve by about 1.38×, while duration
-subtraction improves by about 1.98×. Numeric controls are nearly unchanged in this
-experiment. These results concern these operations and distributions, not every
-date-related SPARQL expression.
+For vector-vector input, date and dateTime subtraction are about 1.38× faster
+with specialization enabled. Duration subtraction is about 1.98× faster. The
+integer and double comparison cases are nearly unchanged. These observations
+apply to the tested subtraction cases; they do not establish the same gains
+for every date operation or input distribution.
 
 The [merged date/duration PR](https://github.com/ad-freiburg/qlever/pull/3737)
-also reports measurements on Wikidata-sized inputs:
+also reports two measurements on larger inputs from Wikidata:
 
 | Reported workload | Input size | Before | After |
 |---|---:|---:|---:|
 | `?death - ?birth` | 3.7 million humans with both dates | 0.39 s | 0.34 s |
 | `?birth + "P30D"^^xsd:dayTimeDuration` | 8.1 million dates | 0.31 s | 0.26 s |
 
-These figures come from the merged PR description; they were not rerun in the
-local campaign. Its description does not provide the full environment and timing
-boundaries, so the absolute times are not directly comparable to our core timers.
-The same description reports gains and mixture-dependent regressions, consistent
-with evaluating the optimization across more than homogeneous inputs.
+The first expression subtracts birth dates from death dates. The second adds a
+30-day duration to birth dates. These measurements are taken from the merged PR
+description, not repeated in the experiments reported here. The description
+does not specify the full environment or exactly which work was timed, so these
+times should not be compared directly with the benchmark times above. The PR
+also reports regressions for some mixtures, reinforcing the need to test inputs
+beyond homogeneous columns.
 
-The UNDEF experiment uses multiplication with standard numeric getters and
-identical arithmetic, toggling only the function's direct-UNDEF opt-in. Exceptions
-are shuffled; the tied case has equal integer and double counts and cannot select
-a unique preferred type. The boolean case checks that accepted boolean conversion
-is retained while undefined rows avoid unnecessary work.
+#### Direct UNDEF handling
 
-| Workload | Disabled ms | Enabled ms | Paired speedup |
+The UNDEF experiment uses multiplication. Both variants use the same numeric
+getters and arithmetic. The enabled variant allows the evaluator to write UNDEF
+directly when an input's datatype guarantees that result. The disabled variant
+uses the existing getter and operation to obtain it.
+
+Undefined entries are shuffled among valid entries. The 35% integer / 35% double
+case has no unique most frequent datatype, so it cannot select a preferred
+numeric datatype for speculative evaluation. The boolean case checks inputs
+that the numeric getter accepts by converting them to integers. The all-integer
+and all-double cases show the effect when there are no undefined inputs to skip.
+
+| Input case | Disabled (ms) | Enabled (ms) | Speedup |
 |---|---:|---:|---:|
 | 70% integer / 30% UNDEF | 33.767 | 24.119 | 1.40× |
 | 70% double / 30% UNDEF | 33.477 | 24.173 | 1.39× |
@@ -392,19 +694,43 @@ is retained while undefined rows avoid unnecessary work.
 | All-integer control | 8.435 | 8.404 | 1.00× |
 | All-double control | 6.656 | 6.791 | 0.98× |
 
-The shortcut helps all four tested mixtures. It does not imply a free check in
-every context: the all-double control's median is about 2% slower with the opt-in,
-while the integer control is close. Small effects can depend on code generation
-and shared-host variation; this result is reported rather than called universally
-regression-free. Broader distributions would be needed to establish their impact.
+Direct UNDEF handling reduces the median batch time for all four tested
+mixtures. For example, the 70% integer / 30% UNDEF case falls from 33.77 to
+24.12 ms, a paired speedup of about 1.40×. The tied integer/double mixture also
+benefits, even though it cannot use a preferred numeric datatype.
+
+The fully numeric cases do not show a uniform improvement. The integer case is
+nearly unchanged, while the all-double median is about 2% slower with direct
+UNDEF handling enabled. Small differences can depend on compiler output and
+variation on the shared machine. These results show a benefit for the tested
+undefined-input mixtures, not a guarantee that enabling the shortcut is free
+for all inputs.
 
 ## Profiling findings
 
+Timing measurements show how long an evaluation takes. Profiles help identify
+which parts of the evaluator account for that work. This section first discusses
+the historical flamegraphs that guided development, then compares profiles of
+the original and final evaluators.
+
 ### Historical flamegraphs
 
-The historical flamegraphs were collected with `perf record --call-graph fp`,
-then processed with `perf script` and the FlameGraph stack-collapsing and SVG
-generation scripts. They show how the investigation developed:
+During development, I collected profiles to investigate which functions accounted
+for most of the sampled execution. The profiles were recorded with
+`perf record --call-graph fp`. This command samples a running process and records
+its call stacks: the chain of functions active at each sample. I then processed
+the recording with `perf script` and the FlameGraph scripts to produce interactive
+SVG images.
+
+A flamegraph groups samples that contain the same call stacks. Each rectangle
+represents a function in a stack. Rectangles above it represent functions called
+from that stack. A wider rectangle means that more samples contain that frame;
+the horizontal position does not represent when the function ran.
+
+The percentages below are *inclusive*: a function's share includes samples in
+functions it calls. For example, if conversion is called inside addition, the
+same sample can contribute to both rectangles. Their percentages must not be
+added as if they were separate costs.
 
 | Prototype profile | Important inclusive profile weights | Finding |
 |---|---|---|
@@ -412,108 +738,157 @@ generation scripts. They show how the investigation developed:
 | Integer-specialized conversion (July 7) | Conversion subtree 47.50%; separate variant frame 27.29%; `isAllInt` 5.36% | Specializing conversion still leaves intermediate representation costs. |
 | DBLP query (July 14) | Addition evaluator 52.41%; nested multiplication 51.42%; nested YEAR evaluator 20.18% | Much of the apparent addition cost belongs to child expressions. |
 
-Open the complete interactive profiles in new tabs:
-<a href="img/flamegraph-batched-add-2026-07-02.svg" target="_blank" rel="noopener">Batch conversion dominates the first prototype</a>,
-<a href="img/flamegraph-integer-conversion-2026-07-07.svg" target="_blank" rel="noopener">Integer conversion still leaves variant overhead</a>, and
-<a href="img/flamegraph-dblp-direct-integer-2026-07-14.svg" target="_blank" rel="noopener">DBLP: child expressions dominate the addition frame</a>.
-Click frames to zoom and search for the named functions.
+In the first prototype, `getNumericBatch` converted ``Id``s into temporary numeric
+vectors. Its large share pointed to conversion and vector construction as costs
+to investigate. Specializing integer conversion still left conversion and variant
+handling prominent. In that graph, `getNumericBatch` and its nested function
+`getNumericBatchInt` both show 47.50% because they cover the same samples.
 
-These are historical prototype profiles, not before/after measurements of the
-final implementation. Their percentages are inclusive: parent and child widths
-overlap. In the integer-conversion graph, `getNumericBatch` and `getNumericBatchInt` both show
-47.50% because they cover the same nested subtree. They must not be counted twice.
-A larger percentage across two graphs also does not imply a larger absolute cost.
+The DBLP profile illustrates the importance of inclusive shares. Most samples
+under addition also occur in its multiplication operands, which include extracting
+years from dates. The addition rectangle therefore does not isolate addition's
+own work. Likewise, a result-export frame can include query computation performed
+while results are requested, rather than serialization alone.
 
-The DBLP graph illustrates another trap: the addition evaluator includes the
-work of its multiplication children. Its 52.41% width is not the cost of the
-addition instruction. Likewise, an export-related ancestor can include lazy
-query computation; its width does not isolate serialization. This motivated
-reusable improvements beyond a dedicated addition expression.
+Open the full graphs in new tabs to inspect those call stacks. Click a rectangle
+to zoom and use the search control to find a function:
 
+- <a href="img/flamegraph-batched-add-2026-07-02.svg" target="_blank" rel="noopener">Batch conversion dominates the first prototype</a>
+- <a href="img/flamegraph-integer-conversion-2026-07-07.svg" target="_blank" rel="noopener">Integer conversion still leaves variant overhead</a>
+- <a href="img/flamegraph-dblp-direct-integer-2026-07-14.svg" target="_blank" rel="noopener">DBLP: child expressions dominate the addition frame</a>
+
+These graphs document prototype development, not a controlled comparison of the
+final implementation. Percentages are relative to each recording, so a larger
+share does not establish a larger absolute cost. The SVGs do not specify exact
+source snapshots or sampled event details, and the raw recordings are not
+included. The `fp` mode also requires frame pointers in the compiled code to
+reconstruct stacks reliably; that build setting has not been verified here.
 An <a href="img/flamegraph-initial-unsymbolized-2026-06-25.svg" target="_blank" rel="noopener">initial server profile with unresolved symbols</a>
-contains many unresolved server frames and is less useful for named-function
-attribution. Exact binary revisions, sampled event details, and raw recordings are not
-embedded in the surviving SVGs. Frame-pointer call stacks also depend on frame
-pointers being available in the profiled code; that build setting has not been
-verified for these captures. The graphs therefore provide development context
-rather than controlled final results.
+contains many frames without function names and offers less useful attribution.
 
 ### Where execution time goes now
 
-The profiles in the following table were collected separately from the historical
-perf flamegraphs. Separate executables linked from the optimized objects were
-profiled using GNU user-space CPU sampling at 100 Hz. Approximately 1,000–1,200 executable-text samples per
-profile provide a flat function-region view, not an instrumented call graph.
-Shared-library costs outside the executable text, including allocator/libc work,
-are not represented in these shares.
+A separate set of benchmark profiles compares the original and final evaluators
+using GNU user-space CPU sampling. At 100 Hz, the profiler samples the current
+instruction address about 100 times per second of sampled CPU time. Each profile
+contains approximately 1,000–1,200 samples in the executable's machine code.
 
-Default gprof output misattributed some coroutine code to neighboring symbols.
-The analysis therefore resolves raw histogram bins against exact ELF symbol
-boundaries and retains unresolved padding rather than inventing attribution.
-The small uncertainty from four-byte bins and sampling remains; profiles and
-wall-clock measurements are collected in separate runs.
+This is a *flat* profile: each sample is assigned to the code region executing
+at that moment, without reconstructing its callers. Unlike flamegraph shares,
+these percentages do not include all called functions. They exclude shared-library
+code, including some memory-allocation and C library work.
 
-| Workload | Old getter share | Old operation coroutine share | Final classifier share | Final typed-loop share |
+The original generators use coroutines: functions that can suspend and resume.
+The default `gprof` report assigned some coroutine code to neighboring functions.
+I instead matched the recorded address ranges to function boundaries in the
+compiled executable and left gaps unresolved. Four-byte recording ranges make
+attribution near boundaries approximate. Profiling and elapsed-time measurements
+were collected in separate runs.
+
+The table shows the main sampled regions before and after optimization:
+
+| Workload | Original getter | Original operation coroutine | Final classification | Final specialized loop |
 |---|---:|---:|---:|---:|
 | Integer vector-vector | 60.7% | 16.1% | 33.9% | 65.4% |
 | Double vector-vector | 59.5% | 16.1% | 41.5% | 57.9% |
 | Integer vector-constant | 46.7% | 20.7% | 27.9% | 71.9% |
 | Ternary integer (left + right + left) | 65.6% | 14.0% | 31.2% | 68.4% |
 
-For integer vector-vector addition, the original getter alone accounts for about
-60.7% of executable-text profile weight, with another 16.1% in the operation
-coroutine. After optimization, classification and typed evaluation dominate.
-The typed loop includes loads, primitive decoding, arithmetic, Id encoding,
-and stores; its whole width cannot be assigned to the arithmetic instruction.
+For integer vector-vector addition, the original getter and operation coroutine
+account for most samples. In the final evaluator, classification and the
+specialized loop dominate instead. That loop includes reading ``Id``s, extracting
+numbers, arithmetic, encoding, and output stores; its share is not the cost of
+the addition instruction alone. The double and ternary cases show the same shift.
 
-Separate classifier-only runs take about 1.93 ms per integer vector-vector batch.
-They classify two columns with numeric-only classification; production addition
-also enables date recognition. Those component runs are therefore corroborating
-evidence, not an exact additive decomposition. A larger relative classification
-share after optimization does not mean classification became slower.
+Each profile has its own total. A larger percentage in the faster evaluator need
+not mean a larger absolute cost, and these shares cannot be used as an exact
+decomposition of the separate elapsed-time measurements.
 
-The final 50/50 mixed numeric profile still places about 61% in the generic
-getter and about 4.4% in classification. This explains why eliminating the
-homogeneous case's dispatch does not remove the same cost from all inputs.
+A separate experiment timed only classification of two integer columns. It took
+about 1.93 ms per batch. That experiment checked numeric datatypes only, whereas
+production addition also recognizes dates. It confirms that classification has
+a measurable cost, but it is not an exact measurement of the classification
+component inside the complete addition benchmark.
+
+The final evaluator behaves differently on evenly mixed numeric input. For the
+50% integer / 50% double case, about 61% of samples still fall in the general
+getter and about 4.4% in classification. Neither datatype is preferred, so the
+specialized speculative loop is unavailable. This agrees with the timing results:
+the homogeneous optimization removes repeated datatype handling for uniform
+columns, but does not remove it for every mixed column.
 
 ## Discussion and conclusion
 
+The results apply to the expressions and inputs tested here. This section
+explains the limits of those measurements, discusses possible improvements
+suggested by the profiles, and summarizes what the project achieved.
+
 ### Limitations
 
-The evaluation is deliberately concentrated on expression execution. Query
-planning, joins, storage access, and export can dominate complete queries, so
-expression speedups must not be quoted as application speedups. The historical
-DBLP profiles and the Wikidata measurements reported in the merged date PR provide
-larger-workload context, but neither set was rerun in the local campaign.
+These expression benchmarks do not measure complete query execution. Finding
+data, combining rows, and producing output may dominate a query's time and limit
+the benefit from faster expressions. The historical DBLP profiles and the
+Wikidata measurements reported in the merged date PR provide larger-input
+context, but were not repeated in the local experiments.
 
-The numeric payloads repeat values modulo 1,000; these bounded inputs avoid
-overflow and do not constitute an exhaustive
-semantic test suite. Existing numeric/date helper tests passed, including date
-classification, block boundaries, and speculative outliers. The full SPARQL suite
-was not rerun. Compiler, cache-size, clustering, and realistic distribution
-sensitivity also remain limits of these measurements.
+Numeric inputs repeat values modulo 1,000 to avoid overflow in the tested
+arithmetic. Date inputs likewise repeat small sets of values. Checking every
+output establishes correctness for those inputs, not all arithmetic edge cases.
+Existing numeric and date helper tests also passed, including classification
+block boundaries and exceptional inputs. The full SPARQL test suite was not rerun
+as part of this evaluation campaign.
+
+The results cover one compiler, one processor, and one input size on a shared
+machine. They do not establish how gains change with compiler output, input sizes
+that interact differently with processor caches, or mixed datatypes arranged in
+groups rather than shuffled. Those conditions require additional measurements.
 
 ### Remaining opportunities
 
-The largest remaining homogeneous region is the typed loop; tied mixtures still
-spend substantial time in generic getters. Possible further work includes
-classification reuse for repeated operands or a better treatment of those mixed
-inputs. Neither is automatically a safe improvement: representation semantics,
-cancellation, extra checks, and compiler behavior all matter. No additional
-production optimization is claimed without a controlled gain and correctness
-validation.
+The profiles suggest different follow-ups for homogeneous and mixed inputs:
+
+- **Reuse classification for repeated operands.** The ternary benchmark reads
+  the left column twice. Reusing its classification could avoid a second scan.
+  The evaluator must establish that both operands share data and require the
+  same checks. Measurements must include that detection cost, even when no
+  operands can share a classification.
+- **Specialize evenly mixed numeric inputs.** A loop could handle integer/double
+  combinations without a preferred datatype or general variants. It would still
+  need datatype checks and the existing arithmetic rules. Comparing it on both
+  mixed and homogeneous inputs would reveal whether those checks introduce
+  regressions.
+- **Investigate the specialized loop.** Its large profile share includes loads,
+  numeric extraction, arithmetic, encoding, and stores. Some loops already use
+  compiler-generated SIMD. Explicit SIMD would need a controlled comparison;
+  profile width alone does not establish that it would help.
+
+These are unimplemented experiments, not claimed speedups. Any change must also
+preserve memory limits, query cancellation, and correctness.
 
 ### Conclusion
 
-The useful change was to move repeated decisions out of the common row. Indexed
-evaluation removed generator traversal; homogeneous classification enabled one
-typed dispatch; speculative execution kept exceptional rows from forcing every
-row through generic handling. Operation-specific UNDEF checks and shared date
-handling extended the approach without inventing new arithmetic semantics.
+This project reduced the work surrounding arithmetic in QLever's expression
+evaluator. The original evaluator obtained values through generators, converted
+them with value getters, and selected operations from variants for each row.
+The changes first replaced generator traversal with indexed access. They then
+used column classification to select specialized loops for homogeneous inputs
+and checked speculative loops for mostly uniform inputs. Further changes avoided
+unnecessary work for undefined results and extended specialization to dates and
+durations.
 
-The measurements show substantial homogeneous expression improvements and much
-smaller gains for tied mixtures. Profiling explains that difference: the original
-work was dominated by generic getters and generator/variant machinery, while
-the homogeneous final path spends its sampled time mainly in classification and
-typed result production. Understanding that shift is more informative than a
-single headline speedup, and identifies where further work would have to help.
+The experiments show the largest gains on homogeneous input. Integer
+vector-vector addition improved from 109.45 to 6.64 ms per measured batch across
+the original and final source snapshots. Mixed inputs benefited less. An even
+integer/double mixture remained faster than the original evaluator, but was
+about 5.8% slower than the intermediate indexed evaluator. The focused date and
+UNDEF experiments also showed benefits for their tested cases, alongside small
+regressions in some comparison cases. These are expression-level results, not
+speedups for complete queries.
+
+Profiling explains the difference between the input cases. The original profiles
+place much of the sampled execution in getters and coroutine code. For the final
+homogeneous evaluator, classification and the specialized loop account for most
+samples. Evenly mixed numeric input still spends much of its sampled execution
+in the general getter. The remaining costs therefore depend on the input's
+datatype distribution. Further optimization should target those measured costs
+and check both correctness and performance across different input cases.
