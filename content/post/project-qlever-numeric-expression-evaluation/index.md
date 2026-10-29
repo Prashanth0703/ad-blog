@@ -17,10 +17,12 @@ a subject, a predicate, and an object. In this example, the person is the subjec
 language for RDF data.
 
 A SPARQL query can also calculate values. For example, the expression `?x + ?y`
-adds the values assigned to two variables for each result row. The addition
-itself is cheap, but QLever must also identify the input datatypes, obtain their
-numeric values, and construct the result. When an expression runs over millions
-of rows, this surrounding work can become expensive.
+adds the values assigned to two variables for each result row. A result column
+can contain different datatypes in different rows, such as integers, doubles,
+and strings. Unlike a typical SQL column with a declared datatype, a SPARQL
+variable is not restricted to one datatype. QLever must therefore determine how
+to interpret each input before adding its value. Over millions of rows, this
+surrounding work can become expensive even when the addition itself is cheap.
 
 In this project, I implemented faster evaluation paths that reduce this overhead.
 The experiments show the largest gains when each input column contains a single
@@ -42,6 +44,7 @@ changes, and the evidence for those results.
   - [Specializing homogeneous operands](#specializing-homogeneous-operands)
   - [Speculative execution for mixed inputs](#speculative-execution-for-mixed-inputs)
   - [Extending the approach to N-ary expressions](#extending-the-approach-to-n-ary-expressions)
+    - [Compilation constraints](#compilation-constraints)
   - [Handling UNDEF and dates](#handling-undef-and-dates)
     - [Direct UNDEF where semantics permit it](#direct-undef-where-semantics-permit-it)
     - [Homogeneous dates and durations](#homogeneous-dates-and-durations)
@@ -86,11 +89,35 @@ returns:
 For this example, QLever needs only three additions. In a larger query, the same
 expression may be evaluated over millions of rows.
 
-All input values in this example are integers. However, QLever's expression
-evaluator must also handle other datatypes, such as doubles, and combinations of
-different datatypes. The original evaluator determined how to interpret the inputs
-separately for each row. Even when every row contained integers, it repeated this
-work.
+All input values in this example are integers. SPARQL also permits mixed
+columns, as the following variation shows:
+
+```sparql
+SELECT ?x ?y ?sum WHERE {
+  VALUES (?x ?y) { (1 10) (2.5e0 20) ("hello" 30) }
+  BIND(?x + ?y AS ?sum)
+}
+```
+
+Here, `?x` contains an integer, a double (`2.5e0`), and a string. The notation
+`2.5e0` means 2.5 in scientific notation and denotes a double in SPARQL. The
+result is:
+
+| `?x` | `?y` | `?sum` |
+|---|---:|---|
+| `1` | 10 | `11` |
+| `2.5e0` | 20 | `22.5` (double) |
+| `"hello"` | 30 | unbound |
+
+The first two rows produce numeric sums. The third attempts to add a string to
+an integer, which causes an expression error. With
+[`BIND`](https://www.w3.org/TR/sparql11-query/#bind), that row remains in the
+result, but `?sum` has no assigned value: it is *unbound*. QLever internally uses
+an undefined-value marker for such results; later sections call it UNDEF.
+
+The evaluator must therefore handle different datatypes and invalid combinations
+within the same column. The original evaluator interpreted the inputs separately
+for each row, even when every row happened to contain integers.
 
 The goal of this project was to avoid repeated datatype handling where possible.
 The optimized evaluator first checks the datatypes in the input columns. If a
@@ -144,7 +171,7 @@ repeated those steps.
 
 ## Implementation
 
-The implementation developed in several steps. The first prototype grouped
+The implementation has been developed in several steps. The first prototype grouped
 conversions into batches but retained much of the original work. The later
 changes removed generator traversal and repeated datatype handling, then extended
 those changes to more operations and datatypes.
@@ -339,6 +366,14 @@ to unary numeric operations, including unary minus, `ABS`, `ROUND`, and `LOG`.
 String, language, geographic, and conditional expressions receive the indexed
 loop improvement rather than numeric specialization.
 
+To test the shared numeric machinery with more than two operands, the evaluation
+below includes a three-argument sum constructed for the benchmark. That sum is
+a test operation, not an additional SPARQL built-in function. Its results show
+how the machinery behaves for that example; they do not measure every expression
+that uses `NaryExpression`.
+
+#### Compilation constraints
+
 Sharing these loops also requires controlling compilation cost. Each additional
 operand increases the number of possible datatype combinations. Generating a
 specialized C++ loop for every combination would increase the work required from
@@ -350,12 +385,6 @@ retain the general evaluator.
 The shared implementation also had to compile correctly with QLever's supported
 compilers. Some expressions needed named temporary variables to avoid
 code-generation failures in Clang 16 and 17.
-
-To test the shared numeric machinery with more than two operands, the evaluation
-below includes a three-argument sum constructed for the benchmark. That sum is
-a test operation, not an additional SPARQL built-in function. Its results show
-how the machinery behaves for that example; they do not measure every expression
-that uses `NaryExpression`.
 
 ### Handling UNDEF and dates
 
@@ -417,7 +446,7 @@ on it is valid. A date and a duration, for example, have different meanings even
 though they use the same C++ representation. The existing arithmetic code still
 checks which combinations are supported and applies their date, timezone, and
 duration rules. The optimization changes how values reach that code; it does not
-replace date arithmetic with subtraction of the ``Id``s' raw bits.
+replace date arithmetic with subtraction of the `Id`s' raw bits.
 
 Mixed columns can use the same speculative approach as numeric columns. Rows
 matching the selected date-related datatype use the specialized operation.
@@ -431,7 +460,7 @@ Classification determines whether a column is homogeneous and counts the values
 of each datatype for speculative evaluation. These counts form a *histogram*:
 one counter per datatype. A straightforward implementation would read each `Id`,
 extract its tag, and increment the corresponding counter. The final classifier
-instead processes blocks of 32 ``Id``s. This organization lets it count common
+instead processes blocks of 32 `Id`s. This organization lets it count common
 patterns with fewer histogram updates.
 
 For each block, the classifier first checks whether all tags match the first
@@ -734,15 +763,18 @@ added as if they were separate costs.
 
 | Prototype profile | Important inclusive profile weights | Finding |
 |---|---|---|
-| Initial batching prototype (July 2) | Addition evaluator 94.82%; nested `getNumericBatch` 75.49% | Investigate conversion/materialization before the arithmetic. |
-| Integer-specialized conversion (July 7) | Conversion subtree 47.50%; separate variant frame 27.29%; `isAllInt` 5.36% | Specializing conversion still leaves intermediate representation costs. |
+| Initial batching profile (July 2) | Addition evaluator 94.82%; nested `getNumericBatch` 75.49% | Investigate conversion/materialization before the arithmetic. |
+| Integer-specialized conversion profile (July 7) | Conversion subtree 47.50%; separate variant frame 27.29%; `isAllInt` 5.36% | Specializing conversion still leaves intermediate representation costs. |
 | DBLP query (July 14) | Addition evaluator 52.41%; nested multiplication 51.42%; nested YEAR evaluator 20.18% | Much of the apparent addition cost belongs to child expressions. |
 
-In the first prototype, `getNumericBatch` converted ``Id``s into temporary numeric
-vectors. Its large share pointed to conversion and vector construction as costs
-to investigate. Specializing integer conversion still left conversion and variant
-handling prominent. In that graph, `getNumericBatch` and its nested function
-`getNumericBatchInt` both show 47.50% because they cover the same samples.
+In the initial batching profile, `getNumericBatch` converted `Id`s into temporary
+numeric vectors. The function's 75.49% share pointed to conversion and vector
+construction as costs to investigate.
+
+In the integer-specialized conversion profile, conversion and variant handling
+remained prominent. `getNumericBatch` and its nested function `getNumericBatchInt`
+both show 47.50% because they cover the same samples. These percentages must not
+be added together.
 
 The DBLP profile illustrates the importance of inclusive shares. Most samples
 under addition also occur in its multiplication operands, which include extracting
@@ -796,7 +828,7 @@ The table shows the main sampled regions before and after optimization:
 
 For integer vector-vector addition, the original getter and operation coroutine
 account for most samples. In the final evaluator, classification and the
-specialized loop dominate instead. That loop includes reading ``Id``s, extracting
+specialized loop dominate instead. That loop includes reading `Id`s, extracting
 numbers, arithmetic, encoding, and output stores; its share is not the cost of
 the addition instruction alone. The double and ternary cases show the same shift.
 
