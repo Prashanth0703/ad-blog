@@ -8,28 +8,12 @@ categories: ["project"]
 draft: true
 ---
 
-QLever is a database engine for querying knowledge graphs. A knowledge graph
-represents entities and their relationships as facts. For example, a fact can
-state that a particular person was born in a particular city. QLever works with
-RDF, the Resource Description Framework, which represents such facts as triples:
-a subject, a predicate, and an object. In this example, the person is the subject,
-“was born in” is the predicate, and the city is the object. SPARQL is a query
-language for RDF data.
-
-A SPARQL query can also calculate values. For example, the expression `?x + ?y`
-adds the values assigned to two variables for each result row. A result column
-can contain different datatypes in different rows, such as integers, doubles,
-and strings. Unlike a typical SQL column with a declared datatype, a SPARQL
-variable is not restricted to one datatype. QLever must therefore determine how
-to interpret each input before adding its value. Over millions of rows, this
-surrounding work can become expensive even when the addition itself is cheap.
-
-In this project, I implemented faster evaluation paths that reduce this overhead.
-The experiments show the largest gains when each input column contains a single
-datatype. Mixed columns benefit less, and some cases become slightly slower than
-an intermediate implementation. These measurements concern expression evaluation,
-not complete query execution. This post explains the original evaluator, the
-changes, and the evidence for those results.
+Evaluating arithmetic expressions over millions of SPARQL result rows can spend
+more time handling datatypes than performing arithmetic. In this project, I
+optimized QLever's expression evaluator through indexed access and specialized
+evaluation for uniform and mostly uniform inputs. Benchmarks show substantial
+gains for uniform numeric inputs, with smaller gains and some regressions for
+mixed inputs.
 
 <!--more-->
 
@@ -64,6 +48,29 @@ changes, and the evidence for those results.
   - [Conclusion](#conclusion)
 
 ## Introduction and motivation
+
+QLever is a database engine for querying knowledge graphs. A knowledge graph
+represents entities and their relationships as facts. For example, a fact can
+state that a particular person was born in a particular city. QLever works with
+RDF, the Resource Description Framework, which represents such facts as triples:
+a subject, a predicate, and an object. In this example, the person is the subject,
+“was born in” is the predicate, and the city is the object. SPARQL is a query
+language for RDF data.
+
+A SPARQL query can also calculate values. For example, the expression `?x + ?y`
+adds the values assigned to two variables for each result row. A result column
+can contain different datatypes in different rows, such as integers, doubles,
+and strings. Unlike a typical SQL column with a declared datatype, a SPARQL
+variable is not restricted to one datatype. QLever must therefore determine how
+to interpret each input before adding its value. Over millions of rows, this
+surrounding work can become expensive even when the addition itself is cheap.
+
+In this project, I implemented faster evaluation paths that reduce this overhead.
+The experiments show the largest gains when each input column contains a single
+datatype. Mixed columns benefit less, and some cases become slightly slower than
+an intermediate implementation. These measurements concern expression evaluation,
+not complete query execution. This post explains the original evaluator, the
+changes, and the evidence for those results.
 
 ### Why optimize an addition?
 
